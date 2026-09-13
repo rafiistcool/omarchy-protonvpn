@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "rafi.protonvpn",
+  "name": "Proton VPN",
+  "version": "1.0.0",
+  "author": "Rafael Till",
+  "license": "MIT",
+  "description": "Connect, disconnect, and pick a Proton VPN country from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Proton VPN",
+    "description": "Toggle Proton VPN and choose a country or city.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "aliases": [
+      "proton",
+      "vpn",
+      "protonvpn"
+    ],
+    "defaults": {
+      "refreshIntervalSec": 15
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}
