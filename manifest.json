@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "rafi.protonvpn",
   "name": "Proton VPN",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "author": "Rafael Till",
   "license": "MIT",
   "description": "Connect, disconnect, and pick a Proton VPN country from the Omarchy bar.",

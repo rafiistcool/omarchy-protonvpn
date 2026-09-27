@@ -225,7 +225,9 @@ Panel {
         country: vpn.country,
         city: vpn.city,
         server: vpn.server,
-        loggedIn: vpn.loggedIn
+        loggedIn: vpn.loggedIn,
+        backend: "cli",
+        error: vpn.lastError
       })
     }
   }
@@ -394,7 +396,7 @@ Panel {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               anchors.margins: Style.space(12)
-              text: "Open Proton VPN to sign in"
+              text: "Sign in with Proton CLI"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body

@@ -1,9 +1,9 @@
 # Proton VPN (Omarchy plugin)
 
 Control Proton VPN from the Omarchy bar. Toggle the tunnel, pick a country
-or city, and jump to the fastest server. Uses the Proton VPN session already
-on this machine — the same Python API as the GTK app. It never asks for a
-password.
+or city, and jump to the fastest server. Uses the official `protonvpn` CLI
+and your existing Proton session. Credentials are entered directly into the
+CLI in a terminal, never into the widget.
 
 ## Install
 
@@ -11,10 +11,21 @@ password.
 omarchy plugin add https://github.com/rafiistcool/omarchy-protonvpn.git --enable --yes
 ```
 
-Needs `proton-vpn-gtk-app` and its Python/NetworkManager dependencies, GNU
-`timeout`, and a signed-in Proton VPN session. The helper uses the system
-Python (`/usr/bin/python3`), where Omarchy installs Proton's libraries. Sign in once with the official app if the
-widget says you are signed out.
+Install the official CLI on Omarchy/Arch:
+
+```bash
+omarchy pkg add proton-vpn-cli
+protonvpn signin YOUR_USERNAME
+```
+
+Alternatively, click **Sign in with Proton CLI** in the widget to open an
+interactive terminal. Proton handles the password and 2FA prompts. Existing
+Proton sessions can be reused. Close the GTK app before using the CLI; Proton
+does not allow both clients to run simultaneously. The GTK package is not needed.
+
+Requires Python 3, GNU `timeout`, and the CLI's NetworkManager/keyring/desktop
+session dependencies. Tested with `proton-vpn-cli` 1.0.3. This is a desktop
+integration, not a headless VPN service.
 
 ## Use
 
@@ -65,17 +76,31 @@ VPN. The QML test requires Quickshell.
 
 The connected indicator follows confirmed state. A pending action has its own
 status text; it never claims a tunnel exists before connection succeeds.
-City selections stay inside the country selected in the panel. Disconnecting
-does not require a successful server-list download, and backend failures are
-reported rather than shown as successful disconnections.
+The adapter checks CLI output as well as exit codes, then verifies the actual
+status after an action. CLI requests from the widget are serialized. Backend
+errors are shown rather than treated as successful connections/disconnections.
 
 Status/list helpers are limited to 15 seconds, connection actions to 60
 seconds. Proton cache files follow `XDG_CACHE_HOME` (default `~/.cache`).
 
-## Notes
+## CLI integration
 
-Do not treat this as a second Proton client running next to a busy GTK window.
-If connect fails while `protonvpn-app` is open, close the app and retry.
+The helper uses the documented `status`, `info`, `countries list`, `cities list`,
+`connect`, and `disconnect` commands. It does not import Proton's internal
+Python API. CLI 1.0.3 provides text output, so an unexpected format is reported
+as an error instead of guessing the connection state.
+
+City names/counts and active-server metadata come from Proton's local,
+read-only `serverlist.json` cache. The CLI refreshes that cache. This also
+works around CLI 1.0.3 ignoring `--country` when `--city` is supplied: the
+helper selects the lowest-score available standard server in the selected
+country/city, within the cached account tier, then calls `protonvpn connect`
+with that explicit server name. Missing city metadata produces an error;
+it never falls back to a same-named city in another country. Secure Core and
+Tor servers are excluded from city selection.
+
+Country/fastest connections remain available without city cache metadata.
+Available features and location selection depend on your Proton plan.
 
 ## License
 

@@ -160,7 +160,7 @@ Item {
   }
 
   function signIn() {
-    Quickshell.execDetached(["protonvpn-app"])
+    Quickshell.execDetached(["omarchy", "launch", "terminal", "bash", Model.fileUrlToPath(Qt.resolvedUrl("signin.sh"))])
   }
 
   Timer {
@@ -198,7 +198,7 @@ Item {
       var stderr = String(statusStderr.text || root._statusError || "")
       if (!actionProcess.running && root.statusRevision === root.stateRevision) {
         if (exitCode === 0) root.applyStatus(stdout)
-        else root.lastError = root.elideStatus(stderr || "Status failed or timed out")
+        else root.lastError = root.elideStatus((Model.parseJson(stdout) || {}).error || stderr || "Status failed or timed out")
       }
     }
   }
@@ -213,7 +213,7 @@ Item {
       var stdout = String(countriesStdout.text || root._countriesOutput || "")
       var stderr = String(countriesStderr.text || root._countriesError || "")
       if (exitCode === 0) root.applyCountries(stdout)
-      else root.lastError = root.elideStatus(stderr || "Could not list countries")
+      else root.lastError = root.elideStatus((Model.parseJson(stdout) || {}).error || stderr || "Could not list countries")
     }
   }
 

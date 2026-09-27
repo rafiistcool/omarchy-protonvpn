@@ -1,435 +1,244 @@
 #!/usr/bin/env python3
-"""JSON control plane for the rafi.protonvpn Omarchy plugin.
+"""Translate the official Proton VPN CLI into the widget's JSON protocol.
 
-Talks to the same Proton VPN Python API the GTK app uses. Prints one JSON
-object on stdout. Proton's own loggers are kept off stdout so the shell can
-parse the result.
+No Proton Python imports. The read-only server cache supplies city metadata
+and country-scoped server selection (CLI 1.0 ignores --country with --city).
 """
-
 from __future__ import annotations
 
 import argparse
-import asyncio
-import contextlib
-import io
+import fcntl
 import json
-import logging
+import math
 import os
-import sys
 from pathlib import Path
-from typing import Any, Optional
+import re
+import subprocess
+import sys
+import time
 
-SECURE_CORE = 1
-TOR = 2
-SKIP_FEATURES = SECURE_CORE | TOR
-CONNECT_TIMEOUT_SEC = 45
-PROTON0 = Path("/sys/class/net/proton0")
-CACHE = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "Proton" / "VPN"
-SERVERLIST_PATH = CACHE / "serverlist.json"
-PERSISTENCE_PATH = CACHE / "connection" / "connection_persistence.json"
-
-
-def _silence_loggers() -> None:
-    logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
-    logging.getLogger().setLevel(logging.CRITICAL)
-    for name in ("proton", "proton.vpn", "proton.session"):
-        logging.getLogger(name).setLevel(logging.CRITICAL)
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+SERVERLIST_PATH = CACHE_HOME / "Proton/VPN/serverlist.json"
+LOCK_PATH = CACHE_HOME / "omarchy-protonvpn/cli.lock"
+SKIP_FEATURES = 1 | 2  # Secure Core and Tor need explicit opt-in.
 
 
-def emit(payload: dict[str, Any], code: int = 0) -> int:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-    return code
+class CliError(RuntimeError):
+    pass
 
 
-def fail(message: str, **extra: Any) -> int:
-    payload = {"ok": False, "error": message}
-    payload.update(extra)
-    return emit(payload, 1)
+class CLI:
+    def __init__(self, seconds=13):
+        self.deadline = time.monotonic() + seconds
+
+    def remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise CliError("Proton VPN CLI timed out")
+        return remaining
+
+    def run(self, *args):
+        try:
+            result = subprocess.run(
+                ["protonvpn", *args], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=self.remaining(),
+                env=dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8", NO_COLOR="1"),
+            )
+        except FileNotFoundError as exc:
+            raise CliError("Install proton-vpn-cli to use this widget") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CliError("Proton VPN CLI timed out") from exc
+        output = result.stdout + "\n" + result.stderr
+        # The GUI-running guard in CLI 1.0 exits successfully after printing Error.
+        error = re.search(r"^\s*Error:\s*(.+)$", output, re.MULTILINE)
+        if error:
+            raise CliError(error.group(1).strip()[:250])
+        if result.returncode or "Traceback (most recent call last)" in output:
+            raise CliError(f"Proton VPN CLI {args[0]} failed; run it in a terminal for details")
+        return result.stdout
 
 
-def proton0_up() -> bool:
-    if not PROTON0.exists():
-        return False
-    oper = PROTON0 / "operstate"
-    if not oper.exists():
-        return True
+def server_cache():
     try:
-        state = oper.read_text(encoding="utf-8").strip().lower()
-    except OSError:
-        return True
-    return state in ("up", "unknown", "dormant")
-
-
-def load_json(path: Path) -> Optional[dict[str, Any]]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def country_name(code: str) -> str:
-    try:
-        from proton.vpn.session.servers.country_codes import get_country_name_by_code
-
-        return str(get_country_name_by_code(code) or code)
-    except Exception:
-        return code
-
-
-def lookup_server(server_id: str, server_name: str) -> dict[str, Any]:
-    data = load_json(SERVERLIST_PATH) or {}
-    logicals = data.get("LogicalServers") or []
-    if not isinstance(logicals, list):
+        data = json.loads(SERVERLIST_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("LogicalServers"), list):
+            raise ValueError
+        return data
+    except (OSError, ValueError):
         return {}
-    sid = str(server_id or "")
-    name = str(server_name or "")
-    for server in logicals:
+
+
+def available_servers(data):
+    try:
+        tier = int(data["MaxTier"])
+    except (KeyError, ValueError, TypeError):
+        return []  # Do not assume access to paid servers when metadata is missing.
+    result = []
+    for server in data.get("LogicalServers", []):
         if not isinstance(server, dict):
             continue
-        if (sid and str(server.get("ID") or "") == sid) or (
-            name and str(server.get("Name") or "") == name
-        ):
-            code = str(server.get("ExitCountry") or "").upper()
-            return {
-                "country": code,
-                "countryName": country_name(code) if code else "",
-                "city": str(server.get("City") or ""),
-                "server": str(server.get("Name") or name),
-                "load": server.get("Load"),
-            }
-    if name:
-        return {"server": name}
-    return {}
-
-
-def persistence_server() -> dict[str, Any]:
-    data = load_json(PERSISTENCE_PATH) or {}
-    server = data.get("server") or {}
-    if not isinstance(server, dict):
-        return {}
-    return lookup_server(str(server.get("server_id") or ""), str(server.get("server_name") or ""))
-
-
-def is_logged_in() -> bool:
-    try:
-        from proton.vpn.core.api import ProtonVPNAPI
-        from proton.vpn.core.session_holder import ClientTypeMetadata
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            api = ProtonVPNAPI(ClientTypeMetadata(type="cli"))
-            return bool(api.is_user_logged_in())
-    except Exception:
-        return False
-
-
-def cmd_status() -> int:
-    connected = proton0_up()
-    details = persistence_server() if connected else {}
-    logged_in = True if connected else is_logged_in()
-    return emit(
-        {
-            "ok": True,
-            "loggedIn": logged_in,
-            "connected": connected,
-            "country": details.get("country") or "",
-            "countryName": details.get("countryName") or "",
-            "city": details.get("city") or "",
-            "server": details.get("server") or "",
-            "load": details.get("load"),
-            "error": "",
-        }
-    )
-
-
-def cmd_countries() -> int:
-    data = load_json(SERVERLIST_PATH)
-    if not data:
-        return fail("Server list cache is missing. Open Proton VPN once to refresh it.")
-
-    max_tier = data.get("MaxTier")
-    try:
-        max_tier_n = int(max_tier) if max_tier is not None else 99
-    except (TypeError, ValueError):
-        max_tier_n = 99
-
-    grouped: dict[str, dict[str, Any]] = {}
-    logicals = data.get("LogicalServers") or []
-    if not isinstance(logicals, list):
-        return fail("Server list cache is unreadable.")
-
-    for server in logicals:
-        if not isinstance(server, dict):
-            continue
-        if server.get("Status") != 1:
-            continue
         try:
-            features = int(server.get("Features") or 0)
-        except (TypeError, ValueError):
-            features = 0
-        if features & SKIP_FEATURES:
+            if (server.get("Status") == 1 and int(server["Tier"]) <= tier
+                    and not int(server["Features"]) & SKIP_FEATURES
+                    and re.fullmatch(r"[A-Z]{2}", server.get("ExitCountry", ""))
+                    and isinstance(server.get("Name"), str)):
+                result.append(server)
+        except (KeyError, ValueError, TypeError):
             continue
-        try:
-            tier = int(server.get("Tier") or 0)
-        except (TypeError, ValueError):
-            tier = 0
-        if tier > max_tier_n:
-            continue
-        code = str(server.get("ExitCountry") or "").upper()
-        if len(code) != 2:
-            continue
-        city = str(server.get("City") or "").strip()
-        entry = grouped.get(code)
-        if entry is None:
-            entry = {"code": code, "name": country_name(code), "servers": 0, "cities": {}}
-            grouped[code] = entry
-        entry["servers"] += 1
-        if city:
-            cities = entry["cities"]
-            cities[city] = cities.get(city, 0) + 1
+    return result
 
+
+def parse_countries(output):
+    # tabulate's simple format separates the name and code by >=2 spaces.
+    if not re.search(r"^Country\s+Code\s*$", output, re.MULTILINE):
+        raise CliError("Unrecognized Proton VPN country list")
     countries = []
-    for entry in grouped.values():
-        city_items = [
-            {"name": name, "servers": count}
-            for name, count in sorted(entry["cities"].items(), key=lambda item: item[0].lower())
-        ]
-        countries.append(
-            {
-                "code": entry["code"],
-                "name": entry["name"],
-                "servers": entry["servers"],
-                "cities": city_items,
-            }
-        )
-    countries.sort(key=lambda item: item["name"].lower())
-    return emit({"ok": True, "countries": countries})
+    for line in output.splitlines():
+        match = re.fullmatch(r"(.+?)\s{2,}([A-Z]{2})\s*", line)
+        if match:
+            countries.append({"code": match[2], "name": match[1].strip(), "cities": []})
+    if not countries:
+        raise CliError("Proton VPN returned no countries")
+    return countries
 
 
-class StateWaiter:
-    def __init__(self, loop: asyncio.AbstractEventLoop, targets: set[int]):
-        self.loop = loop
-        self.targets = targets
-        self.event = asyncio.Event()
-        self.state = None
-
-    def status_update(self, state: Any) -> None:
-        self.state = state
-        state_type = getattr(state, "type", None)
-        if state_type in self.targets:
-            self.loop.call_soon_threadsafe(self.event.set)
-
-
-async def _api_session(refresh: bool = True):
-    from proton.vpn.connection.enum import ConnectionStateEnum
-    from proton.vpn.core.api import ProtonVPNAPI
-    from proton.vpn.core.session_holder import ClientTypeMetadata
-    from proton.vpn.core.vpnconnector import VPNConnector
-    from proton.vpn.session.exceptions import ServerNotFoundError
-
-    api = ProtonVPNAPI(ClientTypeMetadata(type="cli"))
-    if refresh and not api.is_user_logged_in():
-        raise RuntimeError("Not signed in. Open Proton VPN and sign in first.")
-
-    if refresh:
-        await api.refresher.get_up_to_date_server_list()
-        await api.refresher.get_up_to_date_client_config()
-    connector = await api.get_vpn_connector()
-    return api, connector, ConnectionStateEnum, ServerNotFoundError, VPNConnector
+def countries(cli):
+    result = parse_countries(cli.run("countries", "list"))
+    # This command refreshes Proton's server cache before we read city metadata.
+    servers = available_servers(server_cache())
+    grouped = {}
+    for server in servers:
+        group = grouped.setdefault(server["ExitCountry"], [])
+        group.append(server)
+    for country in result:
+        entries = grouped.get(country["code"], [])
+        country["servers"] = len(entries)
+        cities = {}
+        for entry in entries:
+            city = str(entry.get("City") or "").strip()
+            if city:
+                cities[city] = cities.get(city, 0) + 1
+        country["cities"] = [{"name": name, "servers": count}
+                             for name, count in sorted(cities.items(), key=lambda pair: pair[0].casefold())]
+    return {"ok": True, "countries": result}
 
 
-async def _wait_for(connector: Any, targets: set[int], timeout: int) -> Any:
-    loop = asyncio.get_running_loop()
-    waiter = StateWaiter(loop, targets)
-    connector.register(waiter)
-    try:
-        current = getattr(connector, "current_state", None)
-        if current is not None and getattr(current, "type", None) in targets:
-            return current
-        await asyncio.wait_for(waiter.event.wait(), timeout=timeout)
-        return waiter.state
-    except asyncio.TimeoutError as exc:
-        raise TimeoutError("Timed out waiting for Proton VPN") from exc
-    finally:
-        with contextlib.suppress(Exception):
-            connector.unregister(waiter)
+def parse_status(output):
+    matches = re.findall(r"^Status: (Connected|Disconnected)\s*$", output, re.MULTILINE)
+    if len(matches) != 1:
+        raise CliError("Unrecognized Proton VPN status")
+    result = dict(ok=True, backend="cli", connected=matches[0] == "Connected",
+                  loggedIn=True, country="", countryName="", city="", server="", load=None, error="")
+    if not result["connected"]:
+        return result
+    server = re.search(r"^Server: (\S+) in (.+)$", output, re.MULTILINE)
+    load = re.search(r"^Load: (\d+)%\s*$", output, re.MULTILINE)
+    if not server:
+        raise CliError("Incomplete Proton VPN connected status")
+    result["server"] = server[1]
+    result["countryName"] = server[2].strip().split(", ")[-1]
+    result["load"] = int(load[1]) if load else None
+    for cached in server_cache().get("LogicalServers", []):
+        if isinstance(cached, dict) and cached.get("Name") == server[1]:
+            result["country"] = str(cached.get("ExitCountry") or "")
+            result["city"] = str(cached.get("City") or "")
+            break
+    return result
 
 
-def select_server(server_list: Any, kind: str, value: str, country: str = "") -> Any:
-    if kind == "fastest":
-        return server_list.get_fastest()
-    if kind == "country":
-        return server_list.get_fastest_in_country(value)
-    if kind == "city":
-        if not country:
-            return server_list.get_fastest_in_city(value)
-        servers = server_list.get_servers_in_country_code(server_list.logicals, country)
-        servers = server_list.get_servers_in_city(servers, value)
-        servers = server_list.get_available_servers(servers, server_list.user_tier)
-        servers = server_list.get_servers_with_features(servers, exclude_features=SKIP_FEATURES)
-        return server_list.get_fastest_server(servers)
-    raise RuntimeError(f"Unknown connect kind: {kind}")
+def status(cli):
+    result = parse_status(cli.run("status"))
+    if not result["connected"]:
+        account = re.search(r"^Account: '(.*)'\s*$", cli.run("info"), re.MULTILINE)
+        if not account:
+            raise CliError("Unrecognized Proton VPN account status")
+        result["loggedIn"] = account[1] not in ("", "None")
+    return result
 
 
-async def _connect(kind: str, value: str, country: str = "") -> dict[str, Any]:
-    from proton.vpn.connection.enum import ConnectionStateEnum
-
-    api, connector, _enum, ServerNotFoundError, _cls = await _api_session()
-    server_list = api.server_list
-    try:
-        logical = select_server(server_list, kind, value, country)
-    except ServerNotFoundError as exc:
-        raise RuntimeError(str(exc) or "No server available for that location") from exc
-
-    if logical is None:
-        raise RuntimeError("No server available for that location")
-
-    settings = await api.load_settings()
-    vpn_server = connector.get_vpn_server(logical, api.client_config)
-    await connector.connect(vpn_server, protocol=getattr(settings, "protocol", None))
-    state = await _wait_for(
-        connector,
-        {ConnectionStateEnum.CONNECTED, ConnectionStateEnum.ERROR},
-        CONNECT_TIMEOUT_SEC,
-    )
-    state_type = getattr(state, "type", None)
-    if state_type == ConnectionStateEnum.ERROR:
-        raise RuntimeError("Proton VPN failed to connect")
-    if state_type != ConnectionStateEnum.CONNECTED:
-        raise RuntimeError("Proton VPN did not reach connected state")
-
-    code = str(getattr(logical, "exit_country", "") or "").upper()
-    return {
-        "ok": True,
-        "connected": True,
-        "loggedIn": True,
-        "country": code,
-        "countryName": country_name(code) if code else "",
-        "city": str(getattr(logical, "city", "") or ""),
-        "server": str(getattr(logical, "name", "") or ""),
-        "load": getattr(logical, "load", None),
-        "error": "",
-    }
-
-
-async def _disconnect() -> dict[str, Any]:
-    from proton.vpn.connection.enum import ConnectionStateEnum
-
-    _api, connector, _enum, _err, _cls = await _api_session(refresh=False)
-    if not connector.is_connection_active and not proton0_up():
-        return {
-            "ok": True,
-            "connected": False,
-            "loggedIn": True,
-            "country": "",
-            "countryName": "",
-            "city": "",
-            "server": "",
-            "load": None,
-            "error": "",
-        }
-    await connector.disconnect()
-    state = await _wait_for(connector, {ConnectionStateEnum.DISCONNECTED, ConnectionStateEnum.ERROR}, CONNECT_TIMEOUT_SEC)
-    if getattr(state, "type", None) != ConnectionStateEnum.DISCONNECTED:
-        raise RuntimeError("Proton VPN failed to disconnect")
-    return {
-        "ok": True,
-        "connected": False,
-        "loggedIn": True,
-        "country": "",
-        "countryName": "",
-        "city": "",
-        "server": "",
-        "load": None,
-        "error": "",
-    }
-
-
-def run_async(coro: Any) -> dict[str, Any]:
-    with contextlib.redirect_stdout(io.StringIO()):
-        return asyncio.run(coro)
-
-
-def cmd_connect(kind: str, value: str, country: str = "") -> int:
-    try:
-        payload = run_async(_connect(kind, value, country))
-    except Exception as exc:
-        return fail(str(exc) or "Connect failed")
-    return emit(payload)
-
-
-def cmd_disconnect() -> int:
-    try:
-        payload = run_async(_disconnect())
-    except Exception as exc:
-        return fail(str(exc) or "Disconnect failed")
-    return emit(payload)
-
-
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="ctl.py", add_help=True)
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("status", help="Connection snapshot")
-    sub.add_parser("countries", help="Country and city list from cache")
-
-    connect = sub.add_parser("connect", help="Connect to a location")
-    connect.add_argument("target", nargs="?", default="fastest")
-    connect.add_argument("value", nargs="?")
-    connect.add_argument("--country", default="", help="Country code to constrain a city selection")
-
-    sub.add_parser("disconnect", help="Disconnect Proton VPN")
-    return parser.parse_args(argv)
-
-
-def connect_kind(target: str, value: Optional[str]) -> tuple[str, str]:
-    raw = str(target or "fastest").strip()
-    extra = str(value or "").strip()
-    lowered = raw.lower()
-    if lowered in ("fastest", "quick"):
-        return "fastest", ""
-    if lowered in ("country", "cc"):
-        if not extra:
-            raise ValueError("connect country needs a country code")
-        return "country", extra.upper()
-    if lowered in ("city",):
-        if not extra:
-            raise ValueError("connect city needs a city name")
-        return "city", extra
-    if len(raw) == 2 and raw.isalpha() and not extra:
-        return "country", raw.upper()
-    raise ValueError("Usage: connect fastest | connect country DE | connect city Berlin")
-
-
-def main(argv: list[str]) -> int:
-    _silence_loggers()
-    os.environ.setdefault("PYTHONWARNINGS", "ignore")
-    try:
-        args = parse_args(argv)
-    except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 1
-        if code == 0:
-            return 0
-        return fail("Invalid arguments")
-
-    if args.command == "status":
-        return cmd_status()
-    if args.command == "countries":
-        return cmd_countries()
-    if args.command == "disconnect":
-        return cmd_disconnect()
-    if args.command == "connect":
+def city_server(city, country):
+    candidates = [s for s in available_servers(server_cache())
+                  if s["ExitCountry"] == country and str(s.get("City") or "").casefold() == city.casefold()]
+    def score(server):
         try:
-            kind, value = connect_kind(args.target, args.value)
-        except ValueError as exc:
-            return fail(str(exc))
-        country = args.country.strip().upper()
-        if country and (kind != "city" or len(country) != 2 or not country.isascii() or not country.isalpha()):
-            return fail("--country needs a two-letter country code and a city target")
-        return cmd_connect(kind, value, country)
-    return fail("Unknown command")
+            value = float(server["Score"])
+            return value if math.isfinite(value) else math.inf
+        except (KeyError, TypeError, ValueError):
+            return math.inf
+    if not candidates:
+        raise CliError("No available server in that city and country; refresh the location list")
+    return min(candidates, key=score)["Name"]
+
+
+def connect(cli, target, value, country):
+    selected = ""
+    if target == "fastest":
+        args = ["connect"]
+    elif target == "country":
+        if not re.fullmatch(r"[A-Z]{2}", value):
+            raise CliError("Country must be a two-letter code")
+        args = ["connect", "--country", value]
+    elif target == "city":
+        if not value or not re.fullmatch(r"[A-Z]{2}", country):
+            raise CliError("City selection needs a city and a two-letter country code")
+        cli.run("cities", "list", country)  # Refresh metadata, validate country/auth.
+        selected = city_server(value, country)
+        args = ["connect", "--", selected]
+    else:
+        raise CliError("Unknown connection target")
+    output = cli.run(*args)
+    if not re.search(r"^Connected to \S+ in .+", output, re.MULTILINE):
+        raise CliError("Proton VPN did not confirm a connection")
+    result = status(cli)
+    if not result["connected"] or (selected and result["server"] != selected):
+        raise CliError("Proton VPN did not reach the requested connection")
+    if target == "country" and result["country"] and result["country"] != value:
+        raise CliError("Proton VPN connected to a different country")
+    return result
+
+
+def disconnect(cli):
+    output = cli.run("disconnect")
+    if not re.search(r"^Disconnected\.\s*$", output, re.MULTILINE):
+        raise CliError("Proton VPN did not confirm disconnection")
+    result = status(cli)
+    if result["connected"]:
+        raise CliError("Proton VPN is still connected")
+    return result
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for command in ("status", "countries", "disconnect"):
+        commands.add_parser(command)
+    action = commands.add_parser("connect")
+    action.add_argument("target", choices=("fastest", "country", "city"), default="fastest", nargs="?")
+    action.add_argument("value", default="", nargs="?")
+    action.add_argument("--country", default="")
+    args = parser.parse_args(argv)
+    cli = CLI(55 if args.command in ("connect", "disconnect") else 13)
+    try:
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOCK_PATH.open("a") as lock:
+            # Status, list and action helpers share one CLI session at a time.
+            while True:
+                cli.remaining()
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(.05)
+            if args.command == "connect":
+                result = connect(cli, args.target, args.value.upper() if args.target == "country" else args.value,
+                                 args.country.upper())
+            else:
+                result = {"status": status, "countries": countries, "disconnect": disconnect}[args.command](cli)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except (CliError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
 
 
 if __name__ == "__main__":
