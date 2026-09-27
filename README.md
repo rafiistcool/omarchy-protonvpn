@@ -11,8 +11,9 @@ password.
 omarchy plugin add https://github.com/rafiistcool/omarchy-protonvpn.git --enable --yes
 ```
 
-Needs `proton-vpn-gtk-app` (or at least `python-proton-vpn-api-core`) and a
-signed-in Proton VPN session. Sign in once with the official app if the
+Needs `proton-vpn-gtk-app` and its Python/NetworkManager dependencies, GNU
+`timeout`, and a signed-in Proton VPN session. The helper uses the system
+Python (`/usr/bin/python3`), where Omarchy installs Proton's libraries. Sign in once with the official app if the
 widget says you are signed out.
 
 ## Use
@@ -40,6 +41,36 @@ Optional keybind in `~/.config/hypr/bindings.lua`:
 ```lua
 o.bind("SUPER + SHIFT + V", "Toggle Proton VPN", "omarchy-shell rafi.protonvpn toggleVpn")
 ```
+
+## Update and validation
+
+```bash
+omarchy plugin update rafi.protonvpn
+```
+
+`omarchy update` reloads plugins; it does not pull third-party Git repositories.
+
+From a development checkout:
+
+```bash
+node tests/model.test.cjs
+python3 -m unittest discover -s tests -v
+omarchy plugin validate .
+```
+
+Tests use simulated VPN responses; they do not connect or disconnect a real
+VPN. The QML test requires Quickshell.
+
+## Status and timeouts
+
+The connected indicator follows confirmed state. A pending action has its own
+status text; it never claims a tunnel exists before connection succeeds.
+City selections stay inside the country selected in the panel. Disconnecting
+does not require a successful server-list download, and backend failures are
+reported rather than shown as successful disconnections.
+
+Status/list helpers are limited to 15 seconds, connection actions to 60
+seconds. Proton cache files follow `XDG_CACHE_HOME` (default `~/.cache`).
 
 ## Notes
 

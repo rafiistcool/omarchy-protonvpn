@@ -8,10 +8,12 @@ function parseJson(raw) {
 
 function parseStatus(raw) {
   var data = parseJson(raw)
-  if (!data || typeof data !== "object")
+  if (!data || typeof data !== "object" || Array.isArray(data))
     return { ok: false, error: "Failed to parse Proton VPN status" }
   if (data.ok === false)
     return { ok: false, error: String(data.error || "Proton VPN status failed") }
+  if (data.ok !== true || typeof data.connected !== "boolean" || typeof data.loggedIn !== "boolean")
+    return { ok: false, error: "Incomplete Proton VPN status" }
   return {
     ok: true,
     loggedIn: data.loggedIn === true,
@@ -27,12 +29,13 @@ function parseStatus(raw) {
 
 function parseCountries(raw) {
   var data = parseJson(raw)
-  if (!data || typeof data !== "object")
+  if (!data || typeof data !== "object" || Array.isArray(data))
     return { ok: false, error: "Failed to parse country list", countries: [] }
   if (data.ok === false)
     return { ok: false, error: String(data.error || "Country list failed"), countries: [] }
   var list = data.countries
-  if (!Array.isArray(list)) list = []
+  if (data.ok !== true || !Array.isArray(list))
+    return { ok: false, error: "Incomplete country list", countries: [] }
   return { ok: true, error: "", countries: list }
 }
 

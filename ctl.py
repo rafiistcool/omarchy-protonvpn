@@ -24,7 +24,7 @@ TOR = 2
 SKIP_FEATURES = SECURE_CORE | TOR
 CONNECT_TIMEOUT_SEC = 45
 PROTON0 = Path("/sys/class/net/proton0")
-CACHE = Path.home() / ".cache" / "Proton" / "VPN"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "Proton" / "VPN"
 SERVERLIST_PATH = CACHE / "serverlist.json"
 PERSISTENCE_PATH = CACHE / "connection" / "connection_persistence.json"
 
@@ -222,7 +222,7 @@ class StateWaiter:
             self.loop.call_soon_threadsafe(self.event.set)
 
 
-async def _api_session():
+async def _api_session(refresh: bool = True):
     from proton.vpn.connection.enum import ConnectionStateEnum
     from proton.vpn.core.api import ProtonVPNAPI
     from proton.vpn.core.session_holder import ClientTypeMetadata
@@ -230,11 +230,12 @@ async def _api_session():
     from proton.vpn.session.exceptions import ServerNotFoundError
 
     api = ProtonVPNAPI(ClientTypeMetadata(type="cli"))
-    if not api.is_user_logged_in():
+    if refresh and not api.is_user_logged_in():
         raise RuntimeError("Not signed in. Open Proton VPN and sign in first.")
 
-    await api.refresher.get_up_to_date_server_list()
-    await api.refresher.get_up_to_date_client_config()
+    if refresh:
+        await api.refresher.get_up_to_date_server_list()
+        await api.refresher.get_up_to_date_client_config()
     connector = await api.get_vpn_connector()
     return api, connector, ConnectionStateEnum, ServerNotFoundError, VPNConnector
 
@@ -242,11 +243,11 @@ async def _api_session():
 async def _wait_for(connector: Any, targets: set[int], timeout: int) -> Any:
     loop = asyncio.get_running_loop()
     waiter = StateWaiter(loop, targets)
-    current = getattr(connector, "current_state", None)
-    if current is not None and getattr(current, "type", None) in targets:
-        return current
     connector.register(waiter)
     try:
+        current = getattr(connector, "current_state", None)
+        if current is not None and getattr(current, "type", None) in targets:
+            return current
         await asyncio.wait_for(waiter.event.wait(), timeout=timeout)
         return waiter.state
     except asyncio.TimeoutError as exc:
@@ -256,20 +257,29 @@ async def _wait_for(connector: Any, targets: set[int], timeout: int) -> Any:
             connector.unregister(waiter)
 
 
-async def _connect(kind: str, value: str) -> dict[str, Any]:
+def select_server(server_list: Any, kind: str, value: str, country: str = "") -> Any:
+    if kind == "fastest":
+        return server_list.get_fastest()
+    if kind == "country":
+        return server_list.get_fastest_in_country(value)
+    if kind == "city":
+        if not country:
+            return server_list.get_fastest_in_city(value)
+        servers = server_list.get_servers_in_country_code(server_list.logicals, country)
+        servers = server_list.get_servers_in_city(servers, value)
+        servers = server_list.get_available_servers(servers, server_list.user_tier)
+        servers = server_list.get_servers_with_features(servers, exclude_features=SKIP_FEATURES)
+        return server_list.get_fastest_server(servers)
+    raise RuntimeError(f"Unknown connect kind: {kind}")
+
+
+async def _connect(kind: str, value: str, country: str = "") -> dict[str, Any]:
     from proton.vpn.connection.enum import ConnectionStateEnum
 
     api, connector, _enum, ServerNotFoundError, _cls = await _api_session()
     server_list = api.server_list
     try:
-        if kind == "fastest":
-            logical = server_list.get_fastest()
-        elif kind == "country":
-            logical = server_list.get_fastest_in_country(value)
-        elif kind == "city":
-            logical = server_list.get_fastest_in_city(value)
-        else:
-            raise RuntimeError(f"Unknown connect kind: {kind}")
+        logical = select_server(server_list, kind, value, country)
     except ServerNotFoundError as exc:
         raise RuntimeError(str(exc) or "No server available for that location") from exc
 
@@ -307,7 +317,7 @@ async def _connect(kind: str, value: str) -> dict[str, Any]:
 async def _disconnect() -> dict[str, Any]:
     from proton.vpn.connection.enum import ConnectionStateEnum
 
-    _api, connector, _enum, _err, _cls = await _api_session()
+    _api, connector, _enum, _err, _cls = await _api_session(refresh=False)
     if not connector.is_connection_active and not proton0_up():
         return {
             "ok": True,
@@ -321,7 +331,9 @@ async def _disconnect() -> dict[str, Any]:
             "error": "",
         }
     await connector.disconnect()
-    await _wait_for(connector, {ConnectionStateEnum.DISCONNECTED, ConnectionStateEnum.ERROR}, CONNECT_TIMEOUT_SEC)
+    state = await _wait_for(connector, {ConnectionStateEnum.DISCONNECTED, ConnectionStateEnum.ERROR}, CONNECT_TIMEOUT_SEC)
+    if getattr(state, "type", None) != ConnectionStateEnum.DISCONNECTED:
+        raise RuntimeError("Proton VPN failed to disconnect")
     return {
         "ok": True,
         "connected": False,
@@ -340,9 +352,9 @@ def run_async(coro: Any) -> dict[str, Any]:
         return asyncio.run(coro)
 
 
-def cmd_connect(kind: str, value: str) -> int:
+def cmd_connect(kind: str, value: str, country: str = "") -> int:
     try:
-        payload = run_async(_connect(kind, value))
+        payload = run_async(_connect(kind, value, country))
     except Exception as exc:
         return fail(str(exc) or "Connect failed")
     return emit(payload)
@@ -366,6 +378,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     connect = sub.add_parser("connect", help="Connect to a location")
     connect.add_argument("target", nargs="?", default="fastest")
     connect.add_argument("value", nargs="?")
+    connect.add_argument("--country", default="", help="Country code to constrain a city selection")
 
     sub.add_parser("disconnect", help="Disconnect Proton VPN")
     return parser.parse_args(argv)
@@ -412,7 +425,10 @@ def main(argv: list[str]) -> int:
             kind, value = connect_kind(args.target, args.value)
         except ValueError as exc:
             return fail(str(exc))
-        return cmd_connect(kind, value)
+        country = args.country.strip().upper()
+        if country and (kind != "city" or len(country) != 2 or not country.isascii() or not country.isalpha()):
+            return fail("--country needs a two-letter country code and a city target")
+        return cmd_connect(kind, value, country)
     return fail("Unknown command")
 
 

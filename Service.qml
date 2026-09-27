@@ -11,8 +11,9 @@ Item {
 
   property bool loggedIn: false
   property bool connected: false
-  property int _desired: -1
-  readonly property bool active: _desired === -1 ? connected : (_desired === 1)
+  readonly property bool active: connected
+  property int stateRevision: 0
+  property int statusRevision: 0
   property bool refreshing: false
   property bool toggling: false
   property string country: ""
@@ -23,8 +24,6 @@ Item {
   property var countries: []
   property string actionStatus: ""
   property string lastError: ""
-  property string pendingCountry: ""
-  property string pendingCity: ""
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
   readonly property bool busy: statusProcess.running || countriesProcess.running || actionProcess.running
@@ -74,24 +73,11 @@ Item {
     }
     loggedIn = parsed.loggedIn
     connected = parsed.connected
-    if (_desired !== -1 && connected === (_desired === 1)) {
-      _desired = -1
-      pendingCountry = ""
-      pendingCity = ""
-    }
-    if (_desired !== 1) {
-      country = parsed.country
-      countryName = parsed.countryName
-      city = parsed.city
-      server = parsed.server
-      load = parsed.load
-    } else if (parsed.connected && parsed.country) {
-      country = parsed.country
-      countryName = parsed.countryName
-      city = parsed.city
-      server = parsed.server
-      load = parsed.load
-    }
+    country = parsed.country
+    countryName = parsed.countryName
+    city = parsed.city
+    server = parsed.server
+    load = parsed.load
     if (parsed.error) lastError = parsed.error
     else if (!toggling) lastError = ""
   }
@@ -106,6 +92,7 @@ Item {
   }
 
   function refresh(withCountries) {
+    if (actionProcess.running) return
     if (!helperReady) {
       lastError = "Proton VPN helper is missing"
       return
@@ -114,46 +101,33 @@ Item {
       _statusOutput = ""
       _statusError = ""
       refreshing = true
-      statusProcess.command = ["python3", helperPath, "status"]
+      statusRevision = stateRevision
+      statusProcess.command = ["timeout", "--kill-after=2s", "15s", "/usr/bin/python3", helperPath, "status"]
       statusProcess.running = true
     }
     if (withCountries === true && !countriesProcess.running) {
       _countriesOutput = ""
       _countriesError = ""
-      countriesProcess.command = ["python3", helperPath, "countries"]
+      countriesProcess.command = ["timeout", "--kill-after=2s", "15s", "/usr/bin/python3", helperPath, "countries"]
       countriesProcess.running = true
     }
   }
 
-  function runAction(args, label, desired, countryCode, cityName) {
+  function runAction(args, label) {
     if (!helperReady || actionProcess.running) return
     _actionOutput = ""
     _actionError = ""
+    stateRevision++
     toggling = true
     lastError = ""
     actionStatus = label || ""
-    if (desired === 0 || desired === 1) _desired = desired
-    pendingCountry = String(countryCode || "")
-    pendingCity = String(cityName || "")
-    if (desired === 1 && pendingCountry) {
-      country = pendingCountry
-      var found = Model.findCountry(countries, pendingCountry)
-      countryName = found ? String(found.name || "") : pendingCountry
-      city = pendingCity
-    }
-    if (desired === 0) {
-      country = ""
-      countryName = ""
-      city = ""
-      server = ""
-    }
-    actionProcess.command = ["python3", helperPath].concat(args)
+    actionStatusTimer.stop()
+    actionProcess.command = ["timeout", "--kill-after=2s", "60s", "/usr/bin/python3", helperPath].concat(args)
     actionProcess.running = true
-    actionWatchdog.restart()
   }
 
   function connectFastest() {
-    runAction(["connect", "fastest"], "Connecting to fastest server…", 1, "", "")
+    runAction(["connect", "fastest"], "Connecting to fastest server…")
   }
 
   function connectCountry(code) {
@@ -161,18 +135,19 @@ Item {
     if (!/^[A-Z]{2}$/.test(countryCode)) return
     var found = Model.findCountry(countries, countryCode)
     var label = found ? String(found.name || countryCode) : countryCode
-    runAction(["connect", "country", countryCode], "Connecting to " + label + "…", 1, countryCode, "")
+    runAction(["connect", "country", countryCode], "Connecting to " + label + "…")
   }
 
   function connectCity(countryCode, cityName) {
     var city = String(cityName || "").trim()
     if (city === "") return
     var code = String(countryCode || "").toUpperCase()
-    runAction(["connect", "city", city], "Connecting to " + city + "…", 1, code, city)
+    if (!/^[A-Z]{2}$/.test(code)) return
+    runAction(["connect", "city", city, "--country", code], "Connecting to " + city + "…")
   }
 
   function disconnect() {
-    runAction(["disconnect"], "Disconnecting…", 0, "", "")
+    runAction(["disconnect"], "Disconnecting…")
   }
 
   function toggle() {
@@ -211,15 +186,6 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
-  Timer {
-    id: actionWatchdog
-    interval: 60000
-    repeat: false
-    onTriggered: {
-      if (actionProcess.running) actionProcess.running = false
-    }
-  }
-
   Process {
     id: statusProcess
     running: false
@@ -230,8 +196,10 @@ Item {
       root.refreshing = false
       var stdout = String(statusStdout.text || root._statusOutput || "")
       var stderr = String(statusStderr.text || root._statusError || "")
-      if (stdout.trim() !== "") root.applyStatus(stdout)
-      else if (exitCode !== 0) root.lastError = root.elideStatus(stderr || "Status failed")
+      if (!actionProcess.running && root.statusRevision === root.stateRevision) {
+        if (exitCode === 0) root.applyStatus(stdout)
+        else root.lastError = root.elideStatus(stderr || "Status failed or timed out")
+      }
     }
   }
 
@@ -244,8 +212,8 @@ Item {
     onExited: function(exitCode) {
       var stdout = String(countriesStdout.text || root._countriesOutput || "")
       var stderr = String(countriesStderr.text || root._countriesError || "")
-      if (stdout.trim() !== "") root.applyCountries(stdout)
-      else if (exitCode !== 0) root.lastError = root.elideStatus(stderr || "Could not list countries")
+      if (exitCode === 0) root.applyCountries(stdout)
+      else root.lastError = root.elideStatus(stderr || "Could not list countries")
     }
   }
 
@@ -256,7 +224,6 @@ Item {
     stdout: StdioCollector { id: actionStdout; waitForEnd: true; onStreamFinished: root._actionOutput = text }
     stderr: StdioCollector { id: actionStderr; waitForEnd: true; onStreamFinished: root._actionError = text }
     onExited: function(exitCode) {
-      actionWatchdog.stop()
       root.toggling = false
       var stdout = String(actionStdout.text || root._actionOutput || "")
       var stderr = String(actionStderr.text || root._actionError || "")
@@ -272,9 +239,6 @@ Item {
           root.showOsd("Disconnected")
         }
       } else {
-        root._desired = -1
-        root.pendingCountry = ""
-        root.pendingCity = ""
         root.lastError = parsed.error || root.elideStatus(stderr || stdout || "Proton VPN command failed")
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
