@@ -25,10 +25,13 @@ Item {
   property string actionStatus: ""
   property string lastError: ""
 
-  readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
+  readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 300, 30, 3600)
   readonly property bool busy: statusProcess.running || countriesProcess.running || actionProcess.running
   readonly property string helperPath: Model.fileUrlToPath(Qt.resolvedUrl("ctl.py"))
   readonly property bool helperReady: helperPath !== "" && helperPath.indexOf("ctl.py") !== -1
+
+  property double countriesLoadedAt: 0
+  property bool networkRefreshPending: false
 
   property string _statusOutput: ""
   property string _statusError: ""
@@ -89,9 +92,10 @@ Item {
       return
     }
     countries = parsed.countries
+    countriesLoadedAt = Date.now()
   }
 
-  function refresh(withCountries) {
+  function refresh(withCountries, forceCountries) {
     if (actionProcess.running) return
     if (!helperReady) {
       lastError = "Proton VPN helper is missing"
@@ -105,7 +109,8 @@ Item {
       statusProcess.command = ["timeout", "--kill-after=2s", "15s", "/usr/bin/python3", helperPath, "status"]
       statusProcess.running = true
     }
-    if (withCountries === true && !countriesProcess.running) {
+    if (withCountries === true && !countriesProcess.running
+        && (forceCountries === true || countriesLoadedAt === 0 || Date.now() - countriesLoadedAt >= 3600000)) {
       _countriesOutput = ""
       _countriesError = ""
       countriesProcess.command = ["timeout", "--kill-after=2s", "15s", "/usr/bin/python3", helperPath, "countries"]
@@ -169,7 +174,45 @@ Item {
     repeat: true
     running: true
     triggeredOnStart: true
-    onTriggered: root.refresh(root.countries.length === 0)
+    onTriggered: root.refresh(false)
+  }
+
+  // nmcli blocks on NetworkManager events instead of repeatedly starting Proton.
+  // Debounce bursts (device, route and connection changes from one operation).
+  function networkChanged() {
+    networkRefreshPending = true
+    networkDebounce.restart()
+  }
+
+  Timer {
+    id: networkDebounce
+    interval: 2000
+    onTriggered: {
+      if (root.busy) return // A helper exit will drain the pending notification.
+      root.networkRefreshPending = false
+      root.refresh(false)
+    }
+  }
+
+  function drainNetworkRefresh() {
+    if (networkRefreshPending) networkDebounce.restart()
+  }
+
+  Process {
+    id: networkMonitor
+    command: ["nmcli", "monitor"]
+    running: true
+    stdout: SplitParser { onRead: data => root.networkChanged() }
+    onExited: monitorRetry.restart()
+  }
+
+  Timer {
+    id: monitorRetry
+    interval: 60000
+    onTriggered: {
+      networkMonitor.running = true
+      root.networkChanged()
+    }
   }
 
   Timer {
@@ -194,6 +237,7 @@ Item {
     stderr: StdioCollector { id: statusStderr; waitForEnd: true; onStreamFinished: root._statusError = text }
     onExited: function(exitCode) {
       root.refreshing = false
+      root.drainNetworkRefresh()
       var stdout = String(statusStdout.text || root._statusOutput || "")
       var stderr = String(statusStderr.text || root._statusError || "")
       if (!actionProcess.running && root.statusRevision === root.stateRevision) {
@@ -210,6 +254,7 @@ Item {
     stdout: StdioCollector { id: countriesStdout; waitForEnd: true; onStreamFinished: root._countriesOutput = text }
     stderr: StdioCollector { id: countriesStderr; waitForEnd: true; onStreamFinished: root._countriesError = text }
     onExited: function(exitCode) {
+      root.drainNetworkRefresh()
       var stdout = String(countriesStdout.text || root._countriesOutput || "")
       var stderr = String(countriesStderr.text || root._countriesError || "")
       if (exitCode === 0) root.applyCountries(stdout)
@@ -243,7 +288,9 @@ Item {
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       }
-      delayedRefresh.restart()
+      root.networkRefreshPending = false
+      networkDebounce.stop()
+      if (exitCode !== 0 || !parsed.ok) delayedRefresh.restart()
     }
   }
 }

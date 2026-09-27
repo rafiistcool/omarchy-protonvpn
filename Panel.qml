@@ -214,7 +214,7 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): string { vpn.refresh(true); return "ok" }
+    function refresh(): string { vpn.refresh(true, true); return "ok" }
     function connectCountry(code: string): string { vpn.connectCountry(code); return "ok" }
     function disconnect(): string { vpn.disconnect(); return "ok" }
     function toggleVpn(): string { vpn.toggle(); return "ok" }
@@ -245,7 +245,7 @@ Panel {
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) vpn.toggle()
-      else if (buttonCode === Qt.MiddleButton) vpn.refresh(true)
+      else if (buttonCode === Qt.MiddleButton) vpn.refresh(true, true)
       else root.toggle()
     }
 
@@ -298,7 +298,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "t" || t === "T") vpn.toggle()
-        else if (t === "r" || t === "R") vpn.refresh(true)
+        else if (t === "r" || t === "R") vpn.refresh(true, true)
         else if (t === "b" || t === "B") root.openCountries()
         else if (t === "/") root.focusSearch()
       }

@@ -23,7 +23,7 @@ interactive terminal. Proton handles the password and 2FA prompts. Existing
 Proton sessions can be reused. Close the GTK app before using the CLI; Proton
 does not allow both clients to run simultaneously. The GTK package is not needed.
 
-Requires Python 3, GNU `timeout`, and the CLI's NetworkManager/keyring/desktop
+Requires Python 3, GNU `timeout`, `nmcli`, and the CLI's NetworkManager/keyring/desktop
 session dependencies. Tested with `proton-vpn-cli` 1.0.3. This is a desktop
 integration, not a headless VPN service.
 
@@ -82,6 +82,17 @@ errors are shown rather than treated as successful connections/disconnections.
 
 Status/list helpers are limited to 15 seconds, connection actions to 60
 seconds. Proton cache files follow `XDG_CACHE_HOME` (default `~/.cache`).
+
+## Background CPU usage
+
+A persistent `nmcli monitor` waits for NetworkManager events without polling.
+Event bursts are combined into one status check after two seconds. A five-minute
+fallback catches missed events and account changes; `refreshIntervalSec` controls
+this fallback (minimum 30 seconds). Opening the panel refreshes status immediately.
+No country list is loaded at startup. Opening the panel loads it on demand, then
+reuses it for one hour; middle-click, `r`, or IPC refresh forces a fresh list.
+Successful actions already return verified status, so they do not start a second
+redundant CLI check. If the monitor exits, it is retried after one minute.
 
 ## CLI integration
 
