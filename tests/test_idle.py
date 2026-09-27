@@ -16,7 +16,7 @@ class IdleTests(unittest.TestCase):
             root = Path(temp)
             for name in ('Vpn', 'Commons', 'runtime', 'bin'):
                 (root/name).mkdir(mode=0o700)
-            for name in ('Service.qml', 'Model.js'):
+            for name in ('Service.qml', 'Model.js', 'Backend.qml', 'qmldir'):
                 shutil.copy2(ROOT/name, root/'Vpn'/name)
             (root/'Commons/qmldir').write_text('module qs.Commons\nsingleton Util 1.0 Util.qml\n')
             (root/'Commons/Util.qml').write_text('pragma Singleton\nimport QtQml\nQtObject { function execArgv(argv) {} }\n')
@@ -33,7 +33,8 @@ else: print(json.dumps({'ok':True,'connected':False,'loggedIn':True}))
 import Quickshell
 import "Vpn" as Vpn
 ShellRoot {
-  Vpn.Service { id: service }
+  property var service: Vpn.Backend
+  property var otherMonitor: Vpn.Backend
   property int stage: 0
   property double started: Date.now()
   Timer {
@@ -41,7 +42,7 @@ ShellRoot {
     onTriggered: {
       if (service.busy || !service.loggedIn) return
       if (stage === 0) {
-        if (service.refreshIntervalSec !== 300 || service.countriesLoadedAt !== 0) {
+        if (service !== otherMonitor || service.refreshIntervalSec !== 300 || service.countriesLoadedAt !== 0) {
           console.log("BAD_STARTUP"); Qt.quit(); return
         }
         service.networkChanged(); service.networkChanged(); service.networkChanged()

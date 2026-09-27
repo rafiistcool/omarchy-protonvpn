@@ -116,3 +116,6 @@ Available features and location selection depend on your Proton plan.
 ## License
 
 MIT
+
+The backend is shared across monitor bars: multiple displays do not start
+extra collectors, file watchers, or VPN listeners.

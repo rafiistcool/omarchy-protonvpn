@@ -202,10 +202,9 @@ Panel {
   onViewChanged: ensureCursor()
   onListModelChanged: ensureCursor()
 
-  Service {
-    id: vpn
-    settings: root.settings
-  }
+  readonly property var vpn: Backend
+  Component.onCompleted: vpn.settings = root.settings
+  onSettingsChanged: vpn.settings = root.settings
 
   IpcHandler {
     target: root.ipcTarget
