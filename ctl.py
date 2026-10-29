@@ -3,6 +3,8 @@
 
 No Proton Python imports. The read-only server cache supplies city metadata
 and country-scoped server selection (CLI 1.0 ignores --country with --city).
+Connection state comes from NetworkManager: `protonvpn status` contacts the
+VPN server and re-applies the kill switch on every run.
 """
 from __future__ import annotations
 
@@ -20,11 +22,16 @@ import time
 CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
 SERVERLIST_PATH = CACHE_HOME / "Proton/VPN/serverlist.json"
 LOCK_PATH = CACHE_HOME / "omarchy-protonvpn/cli.lock"
+NAMES_PATH = CACHE_HOME / "omarchy-protonvpn/countries.json"
 SKIP_FEATURES = 1 | 2  # Secure Core and Tor need explicit opt-in.
 
 
 class CliError(RuntimeError):
     pass
+
+
+class CliCrashed(CliError):
+    """The CLI failed without printing a reason."""
 
 
 class CLI:
@@ -37,24 +44,35 @@ class CLI:
             raise CliError("Proton VPN CLI timed out")
         return remaining
 
-    def run(self, *args):
+    def _exec(self, program, args, missing, timed_out):
         try:
-            result = subprocess.run(
-                ["protonvpn", *args], stdin=subprocess.DEVNULL,
+            return subprocess.run(
+                [program, *args], stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=self.remaining(),
                 env=dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8", NO_COLOR="1"),
             )
         except FileNotFoundError as exc:
-            raise CliError("Install proton-vpn-cli to use this widget") from exc
+            raise CliError(missing) from exc
         except subprocess.TimeoutExpired as exc:
-            raise CliError("Proton VPN CLI timed out") from exc
+            raise CliError(timed_out) from exc
+
+    def run(self, *args):
+        result = self._exec("protonvpn", args, "Install proton-vpn-cli to use this widget",
+                            "Proton VPN CLI timed out")
         output = result.stdout + "\n" + result.stderr
         # The GUI-running guard in CLI 1.0 exits successfully after printing Error.
         error = re.search(r"^\s*Error:\s*(.+)$", output, re.MULTILINE)
         if error:
             raise CliError(error.group(1).strip()[:250])
         if result.returncode or "Traceback (most recent call last)" in output:
-            raise CliError(f"Proton VPN CLI {args[0]} failed; run it in a terminal for details")
+            raise CliCrashed(f"Proton VPN CLI {args[0]} failed; run it in a terminal for details")
+        return result.stdout
+
+    def nmcli(self, *args):
+        result = self._exec("nmcli", args, "Install NetworkManager (nmcli) to use this widget",
+                            "NetworkManager timed out")
+        if result.returncode:
+            raise CliError("Could not read NetworkManager connections")
         return result.stdout
 
 
@@ -64,6 +82,14 @@ def server_cache():
         if not isinstance(data, dict) or not isinstance(data.get("LogicalServers"), list):
             raise ValueError
         return data
+    except (OSError, ValueError):
+        return {}
+
+
+def country_names():
+    try:
+        names = json.loads(NAMES_PATH.read_text(encoding="utf-8"))
+        return names if isinstance(names, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -104,6 +130,11 @@ def parse_countries(output):
 
 def countries(cli):
     result = parse_countries(cli.run("countries", "list"))
+    try:  # Status names the connected country without starting the CLI.
+        NAMES_PATH.write_text(json.dumps({c["code"]: c["name"] for c in result}, ensure_ascii=False),
+                              encoding="utf-8")
+    except OSError:
+        pass
     # This command refreshes Proton's server cache before we read city metadata.
     servers = available_servers(server_cache())
     grouped = {}
@@ -123,37 +154,46 @@ def countries(cli):
     return {"ok": True, "countries": result}
 
 
-def parse_status(output):
-    matches = re.findall(r"^Status: (Connected|Disconnected)\s*$", output, re.MULTILINE)
-    if len(matches) != 1:
-        raise CliError("Unrecognized Proton VPN status")
-    result = dict(ok=True, backend="cli", connected=matches[0] == "Connected",
-                  loggedIn=True, country="", countryName="", city="", server="", load=None, error="")
-    if not result["connected"]:
-        return result
-    server = re.search(r"^Server: (\S+) in (.+)$", output, re.MULTILINE)
-    load = re.search(r"^Load: (\d+)%\s*$", output, re.MULTILINE)
-    if not server:
-        raise CliError("Incomplete Proton VPN connected status")
-    result["server"] = server[1]
-    result["countryName"] = server[2].strip().split(", ")[-1]
-    result["load"] = int(load[1]) if load else None
-    for cached in server_cache().get("LogicalServers", []):
-        if isinstance(cached, dict) and cached.get("Name") == server[1]:
-            result["country"] = str(cached.get("ExitCountry") or "")
-            result["city"] = str(cached.get("City") or "")
-            break
-    return result
+def active_server(cli):
+    """Server of the activated Proton tunnel, or "" when there is none."""
+    output = cli.nmcli("-t", "-f", "NAME,TYPE,STATE", "connection", "show", "--active")
+    for line in output.splitlines():
+        # Proton names connections "ProtonVPN <server>"; OpenVPN ones have type vpn.
+        name, *rest = re.split(r"(?<!\\):", line)
+        match = re.fullmatch(r"ProtonVPN (\S+)", name)
+        if match and rest in (["wireguard", "activated"], ["vpn", "activated"]):
+            return match[1]
+    return ""
 
 
 def status(cli):
-    result = parse_status(cli.run("status"))
-    if not result["connected"]:
-        account = re.search(r"^Account: '(.*)'\s*$", cli.run("info"), re.MULTILINE)
-        if not account:
-            raise CliError("Unrecognized Proton VPN account status")
-        result["loggedIn"] = account[1] not in ("", "None")
+    server = active_server(cli)
+    result = dict(ok=True, backend="cli", connected=bool(server), loggedIn=True, country="",
+                  countryName="", city="", server=server, load=None, error="")
+    if server:  # A tunnel implies a session, so the CLI is not needed.
+        for cached in server_cache().get("LogicalServers", []):
+            if isinstance(cached, dict) and cached.get("Name") == server:
+                result["country"] = str(cached.get("ExitCountry") or "")
+                result["city"] = str(cached.get("City") or "")
+                load = cached.get("Load")
+                result["load"] = load if type(load) is int else None
+                break
+        result["countryName"] = str(country_names().get(result["country"]) or "")
+        return result
+    account = re.search(r"^Account: '(.*)'\s*$", cli.run("info"), re.MULTILINE)
+    if not account:
+        raise CliError("Unrecognized Proton VPN account status")
+    result["loggedIn"] = account[1] not in ("", "None")
     return result
+
+
+def settled_status(cli, connected):
+    # NetworkManager normally updates before the CLI returns; allow brief lag.
+    for _ in range(10):
+        if bool(active_server(cli)) == connected:
+            break
+        time.sleep(.1)
+    return status(cli)
 
 
 def city_server(city, country):
@@ -186,10 +226,17 @@ def connect(cli, target, value, country):
         args = ["connect", "--", selected]
     else:
         raise CliError("Unknown connection target")
-    output = cli.run(*args)
+    for attempt in range(2):
+        try:
+            output = cli.run(*args)
+            break
+        except CliCrashed:
+            # CLI 1.0 rolls back and exits silently when the server misses its 10 s handshake.
+            if attempt or cli.deadline - time.monotonic() < 20:
+                raise CliError("Proton VPN server did not confirm the connection in time; try again") from None
     if not re.search(r"^Connected to \S+ in .+", output, re.MULTILINE):
         raise CliError("Proton VPN did not confirm a connection")
-    result = status(cli)
+    result = settled_status(cli, True)
     if not result["connected"] or (selected and result["server"] != selected):
         raise CliError("Proton VPN did not reach the requested connection")
     if target == "country" and result["country"] and result["country"] != value:
@@ -201,7 +248,7 @@ def disconnect(cli):
     output = cli.run("disconnect")
     if not re.search(r"^Disconnected\.\s*$", output, re.MULTILINE):
         raise CliError("Proton VPN did not confirm disconnection")
-    result = status(cli)
+    result = settled_status(cli, False)
     if result["connected"]:
         raise CliError("Proton VPN is still connected")
     return result

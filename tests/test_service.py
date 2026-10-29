@@ -67,4 +67,43 @@ ShellRoot {
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('VPN_TEST_PASS', result.stdout + result.stderr)
 
+    def test_failed_action_is_announced_outside_the_panel(self):
+        # A connect started from the bar has no panel to show the error in.
+        with tempfile.TemporaryDirectory(prefix='vpn-qml-') as temp:
+            root = Path(temp)
+            for name in ('Vpn', 'Commons', 'runtime'):
+                (root / name).mkdir(mode=0o700)
+            for name in ('Service.qml', 'Model.js'):
+                shutil.copy2(ROOT / name, root / 'Vpn' / name)
+            (root / 'Commons/qmldir').write_text('module qs.Commons\nsingleton Util 1.0 Util.qml\n')
+            (root / 'Commons/Util.qml').write_text('pragma Singleton\nimport QtQml\n'
+                'QtObject { function execArgv(argv) { console.log("VPN_OSD " + argv.join(" ")) } }\n')
+            (root / 'Vpn/ctl.py').write_text('''import json,sys
+if sys.argv[1] == 'connect':
+ print(json.dumps({'ok':False,'error':'Proton VPN server did not confirm the connection in time; try again'}))
+ sys.exit(1)
+print(json.dumps({'ok':True,'loggedIn':True,'connected':False}))
+''')
+            (root / 'shell.qml').write_text('''import QtQuick
+import Quickshell
+import "Vpn" as Vpn
+ShellRoot {
+  Vpn.Service { id: service }
+  property int stage: 0
+  Timer {
+    interval: 20; running: true; repeat: true
+    onTriggered: {
+      if (stage === 0 && service.loggedIn && !service.busy) { service.connectFastest(); stage = 1 }
+      else if (stage === 1 && !service.toggling) { console.log("VPN_TEST_DONE"); Qt.quit() }
+    }
+  }
+}
+''')
+            env = dict(os.environ, QT_QPA_PLATFORM='offscreen', XDG_RUNTIME_DIR=str(root / 'runtime'))
+            result = subprocess.run(['qs', '-p', str(root), '--no-color'], env=env,
+                                    capture_output=True, text=True, timeout=8)
+            output = result.stdout + result.stderr
+            self.assertIn('VPN_TEST_DONE', output)
+            self.assertRegex(output, r'VPN_OSD omarchy-shell -q osd show .*Connection failed')
+
 if __name__ == '__main__': unittest.main()

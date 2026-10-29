@@ -76,9 +76,16 @@ VPN. The QML test requires Quickshell.
 
 The connected indicator follows confirmed state. A pending action has its own
 status text; it never claims a tunnel exists before connection succeeds.
-The adapter checks CLI output as well as exit codes, then verifies the actual
-status after an action. CLI requests from the widget are serialized. Backend
-errors are shown rather than treated as successful connections/disconnections.
+The adapter checks CLI output as well as exit codes, then confirms the tunnel
+in NetworkManager after an action. CLI requests from the widget are serialized.
+Backend errors are shown rather than treated as successful connections/disconnections.
+A failed action also shows an on-screen message, because a bar click has no
+panel to show the error in.
+
+Proton's CLI waits 10 seconds for the VPN server to confirm a new connection.
+If the server is slower, the CLI removes the tunnel again and exits without a
+message. The helper retries such a connect once; if that fails too, it reports
+that the server did not confirm the connection in time.
 
 Status/list helpers are limited to 15 seconds, connection actions to 60
 seconds. Proton cache files follow `XDG_CACHE_HOME` (default `~/.cache`).
@@ -96,10 +103,17 @@ redundant CLI check. If the monitor exits, it is retried after one minute.
 
 ## CLI integration
 
-The helper uses the documented `status`, `info`, `countries list`, `cities list`,
+The helper uses the documented `info`, `countries list`, `cities list`,
 `connect`, and `disconnect` commands. It does not import Proton's internal
-Python API. CLI 1.0.3 provides text output, so an unexpected format is reported
+Python API. CLI 1.0 provides text output, so an unexpected format is reported
 as an error instead of guessing the connection state.
+
+Connection state comes from NetworkManager's active `ProtonVPN <server>`
+connection, not from `protonvpn status`. That command contacts the VPN server,
+downloads server loads and re-applies the kill switch on every run. With a
+tunnel up, a status check starts no Proton process; without one, it only runs
+`protonvpn info` to learn whether you are signed in. The connected country's
+name comes from the last country list.
 
 City names/counts and active-server metadata come from Proton's local,
 read-only `serverlist.json` cache. The CLI refreshes that cache. This also

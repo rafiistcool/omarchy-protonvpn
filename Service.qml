@@ -23,6 +23,7 @@ Item {
   property var load: null
   property var countries: []
   property string actionStatus: ""
+  property string actionKind: ""
   property string lastError: ""
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 300, 30, 3600)
@@ -126,6 +127,7 @@ Item {
     toggling = true
     lastError = ""
     actionStatus = label || ""
+    actionKind = args[0]
     actionStatusTimer.stop()
     actionProcess.command = ["timeout", "--kill-after=2s", "60s", "/usr/bin/python3", helperPath].concat(args)
     actionProcess.running = true
@@ -287,6 +289,8 @@ Item {
         root.lastError = parsed.error || root.elideStatus(stderr || stdout || "Proton VPN command failed")
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
+        // Bar clicks have no panel to show the error in.
+        root.showOsd(root.actionKind === "disconnect" ? "Disconnect failed" : "Connection failed")
       }
       root.networkRefreshPending = false
       networkDebounce.stop()
